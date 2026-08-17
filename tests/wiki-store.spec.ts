@@ -81,4 +81,16 @@ describe('WikiStore MVP loop', () => {
     const candidateSource = await readFile(join(wiki.stateDir, 'candidates', `${proposal.candidate.candidateId}.json`), 'utf8')
     expect(candidateSource).toContain('"status": "published"')
   })
+
+  it('dismisses a candidate without changing the canonical wiki', async () => {
+    const wiki = await store()
+    const proposal = await wiki.propose(trace('dismiss-a', 1), 'problem-pattern | Rejected Example Pattern | This candidate must remain outside the canonical wiki.')
+
+    await wiki.dismiss(proposal.candidate.candidateId)
+
+    expect(await wiki.list()).toHaveLength(0)
+    const candidateSource = await readFile(join(wiki.stateDir, 'candidates', `${proposal.candidate.candidateId}.json`), 'utf8')
+    expect(candidateSource).toContain('"status": "dismissed"')
+    await expect(wiki.publish(proposal.candidate.candidateId)).rejects.toThrow(/dismissed/)
+  })
 })

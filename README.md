@@ -1,6 +1,6 @@
 # DeepSeek Harness Loop Engineering 插件
 
-本目录是 [`loop-engineering-plugin-PRD.md`](./loop-engineering-plugin-PRD.md) 所定义 MVP 的可运行实现。它把 Harness 中持续产生的会话事件压缩成结构化工程轨迹，再把值得复用的经验整理为候选知识；候选知识必须经过检查后，才会以可被 Git 审查的 Markdown 文件进入团队 Wiki。
+本目录是 Loop Engineering MVP 的可运行实现。它把 Harness 中持续产生的会话事件压缩成结构化工程轨迹，再把值得复用的经验整理为候选知识；候选知识必须经过检查后，才会以可被 Git 审查的 Markdown 文件进入团队 Wiki。
 
 插件解决的核心问题是：保留“问题为什么发生、如何定位、怎样修复、用什么证据验证”，同时避免把冗长的完整会话直接塞进后续任务的上下文。
 
@@ -11,7 +11,7 @@ Harness 会话事件
     │
     ▼
 EngineeringTrace（压缩后的工程轨迹）
-    │  仅在任务已解决且价值达到门槛时自动继续
+    │  确定性证据门 → deepseek-v4-flash 复用价值判断
     ▼
 KnowledgeCandidate（待审查知识候选）
     │
@@ -28,6 +28,8 @@ wiki/**/*.md（规范知识，适合 Git diff 和代码审查）
     └─ 后续任务按 L0 卡片 → L1 正文/章节 → L2 证据渐进读取
 ```
 
+读取链同样采用两级门控：短文本、翻译等明显无关任务先由本地规则跳过；其余工程任务在第一步交给 `deepseek-v4-flash` 判断历史知识是否真的有帮助并改写检索词。工具产生明确错误后的第二次检索直接使用错误片段，不额外调用模型。轻量模型超时、配置错误或暂时不可用时，插件回退到原有确定性策略，不阻塞主任务。
+
 ## 详细目录树
 
 右侧注释说明每个目录或文件的职责；标有“运行时生成”的内容不会作为规范知识提交。
@@ -35,8 +37,9 @@ wiki/**/*.md（规范知识，适合 Git diff 和代码审查）
 ```text
 loop-engineering-plugin/
 ├─ README.md                              # 当前文档：架构、目录、运行方法、工具和测试说明
-├─ loop-engineering-plugin-PRD.md          # 产品需求真源：目标、知识模型、交互方式和 MVP 验收条件
-├─ 插件底层架构与链路分析.md               # 源码导读：注册生命周期、领域概念及 PRD 三大链路的逐步分析
+├─ loop-engineering-plugin-PRD.md          # 本地资料（默认忽略）：产品需求、知识模型和验收条件
+├─ 插件底层架构与链路分析.md               # 本地资料（默认忽略）：生命周期、领域概念和链路源码导读
+├─ 简历内容.md                            # 本地资料（默认忽略）：按 STAR 法则整理的项目简历描述
 ├─ package.json                           # 插件包信息、Harness 工作区依赖、test/typecheck 脚本
 ├─ tsconfig.json                          # TypeScript 编译与类型检查配置
 ├─ vitest.config.ts                       # Vitest 测试根目录和测试文件匹配规则
@@ -48,11 +51,14 @@ loop-engineering-plugin/
 │  ├─ types.ts                            # 领域类型：知识页、轨迹、候选、Patch、会话工作集
 │  ├─ text.ts                             # 文本基础能力：分词、哈希版本、内容提取、截断、ID slug
 │  ├─ trace-builder.ts                    # 把追加式 Session Events 投影成紧凑 EngineeringTrace
+│  ├─ decision-gate.ts                    # 低成本前置过滤、模型提示、JSON 校验和候选格式转换
+│  ├─ flash-judge.ts                      # 通过 Harness LLM 服务调用 deepseek-v4-flash 并记录判断
 │  └─ wiki-store.ts                       # Wiki 核心：Markdown 解析、搜索、蒸馏、校验、发布和原子写入
 │
 ├─ tests/                                 # 不依赖真实 Web UI 的快速自动化测试
 │  ├─ trace-builder.spec.ts               # 验证事件压缩、解决置信度和低价值任务过滤
-│  └─ wiki-store.spec.ts                  # 验证 L0/L1/L2、发布门禁、Search Before Create 和重复合并
+│  ├─ decision-gate.spec.ts               # 验证轻量判断的前置过滤、JSON 校验和学习格式转换
+│  └─ wiki-store.spec.ts                  # 验证检索、发布、驳回、Search Before Create 和重复合并
 │
 ├─ wiki/                                  # 规范知识库；这里的 Markdown 才是团队可审查的知识真源
 │  ├─ problem-pattern/                    # 问题模式：症状、触发条件、根因、诊断、方案和验证证据
@@ -71,6 +77,7 @@ loop-engineering-plugin/
 │  ├─ traces/                             # 每个已完成 turn 的紧凑 EngineeringTrace JSON
 │  ├─ candidates/                         # 待审、已发布或已驳回的 KnowledgeCandidate JSON
 │  ├─ patches/                            # 针对 Wiki 的确定性 KnowledgePatch JSON
+│  ├─ decisions/                          # deepseek-v4-flash 检索/学习判断的 JSONL 审计记录
 │  └─ feedback/                           # knowledge_feedback 追加写入的 JSONL 反馈
 │
 ├─ node_modules/                          # pnpm 工作区依赖链接；安装依赖时生成
@@ -78,6 +85,8 @@ loop-engineering-plugin/
 ├─ dsh-loop.stdout.log                    # 后台 Web 服务标准输出；运行时生成
 └─ dsh-loop.stderr.log                    # 后台 Web 服务错误输出；运行时生成
 ```
+
+根目录 Markdown 说明资料默认由 `.gitignore` 排除，远程仓库只保留 `README.md`；`wiki/**/*.md` 是插件运行所需的规范知识数据，仍正常纳入版本控制。
 
 ## 核心模块如何协作
 
@@ -87,6 +96,12 @@ loop-engineering-plugin/
 
 - `session/event`：持续把会话事件交给 `TraceBuilder`；turn 完成后写入轨迹，并为高价值任务自动生成候选知识。
 - `agent/pre-step`：在任务第一步或工具出现强错误证据后执行低成本检索，把 L0 卡片作为插件来源的会话消息注入当前任务。
+
+两个钩子都先执行便宜、可解释的硬门禁，再只对语义判断调用 `deepseek-v4-flash`。模型只拥有“建议检索”和“建议生成候选”的权限；它不能发布或驳回知识。
+
+### `decision-gate.ts` 与 `flash-judge.ts`：轻量语义判断
+
+`decision-gate.ts` 负责过滤明显无关输入、构造最短必要提示，并严格校验模型返回的 JSON。`flash-judge.ts` 通过 Harness 已注册的 `llm` 服务调用 `deepseek-official/deepseek-v4-flash`，限制输出 token 和超时时间，并把决定写入 `.loop-engineering/decisions/flash-judgements.jsonl`。学习判断只接收已经完成且有证据的紧凑轨迹，不发送整段聊天历史。
 
 ### `trace-builder.ts`：只保留工程上有用的信息
 
@@ -158,6 +173,8 @@ Web UI 命令面板提供受控写入路径：
 /knowledge-candidates
 /knowledge-review publish <candidate-id>
 /knowledge-review dismiss <candidate-id>
+/knowledge-review 发布 <candidate-id>
+/knowledge-review 驳回 <candidate-id>
 ```
 
 其中 `type` 可以是：
@@ -169,6 +186,8 @@ architecture-decision
 ```
 
 模型生成的文字不会直接覆盖规范 Markdown。`/save-knowledge` 只生成候选和 Patch；`publish` 才会应用已经检查过的确定性变更，`dismiss` 则只改变候选状态而不修改 Wiki。
+
+人工审查建议先运行 `/knowledge-candidates` 获取 ID，再打开 `.loop-engineering/candidates/<ID>.json` 和对应 Patch 检查标题、摘要、证据、目标文件和 `verification`。发布后应看到 `wiki/` 新增或更新 Markdown，候选状态变为 `published`；驳回后 Wiki 必须保持不变，候选状态变为 `dismissed`。
 
 ## 配置说明
 
@@ -183,6 +202,10 @@ architecture-decision
 - `autoCandidateThreshold`：自动生成候选所需的最低解决置信度。
 - `maxCardChars`：单张 L0 卡片的字符上限。
 - `maxContextChars`：一次自动注入的总字符上限。
+- `lightweightJudge`：是否启用轻量模型语义判断；关闭后使用纯确定性策略。
+- `judgeProvider` / `judgeModel`：判断模型路由，默认 `deepseek-official/deepseek-v4-flash`。
+- `judgeMaxTokens`：单次判断最大输出 token，默认 320。
+- `judgeTimeoutMs`：单次判断最长等待时间，默认 12000 毫秒。
 
 ## 验证与测试
 
@@ -196,8 +219,8 @@ architecture-decision
 当前测试预期为：
 
 ```text
-Test Files  2 passed (2)
-Tests       5 passed (5)
+Test Files  3 passed (3)
+Tests       10 passed (10)
 ```
 
-自动化测试覆盖轨迹压缩、低价值门、L0/L1/L2 渐进检索、证据生命周期、Search Before Create，以及同一问题多次出现时只更新一个知识页。
+自动化测试覆盖轨迹压缩、两级判断门、模型 JSON 校验、L0/L1/L2 渐进检索、人工发布/驳回、证据生命周期、Search Before Create，以及同一问题多次出现时只更新一个知识页。

@@ -11,3 +11,8 @@
         autoCandidateThreshold: 0.65
         maxCardChars: 520
         maxContextChars: 2400
+        lightweightJudge: true
+        judgeProvider: 'deepseek-official'
+        judgeModel: 'deepseek-v4-flash'
+        judgeMaxTokens: 320
+        judgeTimeoutMs: 12000
