@@ -1,0 +1,13 @@
+- insert:
+    - id: loop-engineering
+      name: 'file:///D:/code/deepseek-harness/loop-engineering-plugin/src/index.ts'
+      config:
+        wikiDir: 'D:/code/deepseek-harness/loop-engineering-plugin/wiki'
+        stateDir: 'D:/code/deepseek-harness/loop-engineering-plugin/.loop-engineering'
+        automaticRetrieval: true
+        maxAutomaticRetrievalsPerTask: 2
+        maxSearchResults: 5
+        duplicateThreshold: 0.58
+        autoCandidateThreshold: 0.65
+        maxCardChars: 520
+        maxContextChars: 2400

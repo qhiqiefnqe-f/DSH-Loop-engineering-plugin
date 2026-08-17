@@ -1,0 +1,5 @@
+.loop-engineering/
+node_modules/
+*.tsbuildinfo
+*.stdout.log
+*.stderr.log
