@@ -3,14 +3,17 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { EngineeringTrace } from './types.ts'
+import type { EngineeringTrace, KnowledgeCard } from './types.ts'
 import {
   learningPrompt,
   parseLearningDecision,
   parseRetrievalDecision,
+  parseRerankDecision,
+  rerankPrompt,
   retrievalPrompt,
   type LearningDecision,
   type RetrievalDecision,
+  type RerankDecision,
 } from './decision-gate.ts'
 
 /** 轻量判断模型的部署配置。 */
@@ -45,6 +48,14 @@ export class FlashKnowledgeJudge {
     return decision
   }
 
+  /** 在融合候选分差较小时，根据 L0 语义重新排序。 */
+  async rerank(query: string, cards: KnowledgeCard[], sessionId: string): Promise<RerankDecision> {
+    const raw = await this.complete(rerankPrompt(query, cards), sessionId)
+    const decision = parseRerankDecision(raw, new Set(cards.map(card => card.id)))
+    await this.audit('rerank', sessionId, decision)
+    return decision
+  }
+
   private async complete(prompt: string, sessionId: string): Promise<string> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs)
@@ -75,7 +86,7 @@ export class FlashKnowledgeJudge {
     return text
   }
 
-  private async audit(kind: 'retrieval' | 'learning', sessionId: string, decision: object): Promise<void> {
+  private async audit(kind: 'retrieval' | 'learning' | 'rerank', sessionId: string, decision: object): Promise<void> {
     const directory = join(this.config.stateDir, 'decisions')
     await mkdir(directory, { recursive: true })
     await appendFile(join(directory, 'flash-judgements.jsonl'), `${JSON.stringify({

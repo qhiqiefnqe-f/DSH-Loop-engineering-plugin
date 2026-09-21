@@ -14,6 +14,7 @@ import type {
   SearchOptions,
 } from './types.ts'
 import { contentVersion, slugify, tokenize } from './text.ts'
+import { bm25fScores, reciprocalRankFusion, routeKnowledgeTypes, type Bm25fField } from './retrieval.ts'
 
 /**
  * Git/Markdown Wiki 的领域存储实现。
@@ -37,13 +38,17 @@ interface StoreConfig {
   wikiDir: string
   stateDir: string
   duplicateThreshold: number
+  rrfK: number
+  exactRrfWeight: number
+  bm25RrfWeight: number
+  metadataRrfWeight: number
 }
 
 /** 为一次搜索临时编译的文档统计；不写磁盘，也不成为长期索引。 */
 interface SearchDocument {
   unit: KnowledgeUnit
-  tokens: string[]
-  termCounts: Map<string, number>
+  fields: Record<string, Bm25fField>
+  metadataTokens: Set<string>
 }
 
 /** Loop Engineering 知识能力的本地 Git/Markdown 提供方。 */
@@ -51,12 +56,14 @@ export class WikiStore {
   readonly wikiDir: string
   readonly stateDir: string
   private readonly duplicateThreshold: number
+  private readonly retrieval: Pick<StoreConfig, 'rrfK' | 'exactRrfWeight' | 'bm25RrfWeight' | 'metadataRrfWeight'>
 
   constructor(config: StoreConfig) {
     // 统一成绝对路径，避免 Web 进程工作目录变化时读写到不同位置。
     this.wikiDir = resolve(config.wikiDir)
     this.stateDir = resolve(config.stateDir)
     this.duplicateThreshold = config.duplicateThreshold
+    this.retrieval = config
   }
 
   /** 创建提供方拥有的全部目录；`recursive` 让重复初始化安全且幂等。 */
@@ -81,7 +88,7 @@ export class WikiStore {
   }
 
   /**
-   * BM25 风格全文检索，再叠加 scope、生命周期和置信度排序。
+   * BM25F 字段检索，再叠加类型软路由、scope、生命周期和置信度排序。
    *
    * MVP 每次搜索都从 Markdown 重新编译轻量索引：规模小、行为透明，并能立即看到手工编辑结果。
    * 未来若换向量库，`KnowledgeCard` 和上层工具接口仍可保持不变。
@@ -100,29 +107,32 @@ export class WikiStore {
       .map(unit => searchDocument(unit))
     if (documents.length === 0) return []
 
-    const averageLength = documents.reduce((total, document) => total + document.tokens.length, 0) / documents.length
-    const cards = documents.map((document): KnowledgeCard | undefined => {
-      let score = 0
-      // 对 query 去重：同一个词在用户输入中重复多次不应无限抬高相关度。
-      for (const token of new Set(queryTokens)) {
-        const containing = documents.filter(candidate => candidate.termCounts.has(token)).length
-        // IDF：越少文档包含这个词，它越能区分知识页面。
-        const idf = Math.log(1 + (documents.length - containing + 0.5) / (containing + 0.5))
-        const frequency = document.termCounts.get(token) ?? 0
-        // 文档长度归一化，避免内容很长的页面仅凭重复词天然占优。
-        const denominator = frequency + 1.2 * (0.25 + 0.75 * document.tokens.length / Math.max(1, averageLength))
-        score += idf * ((frequency * 2.2) / Math.max(0.001, denominator))
-      }
-      if (score <= 0) return undefined
-      // verified 权重最高；stale 明显降权但仍可作为排查线索；reviewed/draft 位于两者之间。
+    const bm25 = bm25fScores(documents.map(document => ({
+      id: document.unit.metadata.id,
+      fields: document.fields,
+    })), queryTokens)
+    const exact = new Map(documents.map(document => [document.unit.metadata.id, exactFieldScore(document.unit, query)]))
+    const metadata = new Map(documents.map(document => [document.unit.metadata.id, tokenCoverage(queryTokens, document.metadataTokens)]))
+    const typeRoutes = options.type === undefined ? routeKnowledgeTypes(query) : undefined
+    const ranked = (scores: Map<string, number>) => [...scores.entries()].filter(([, score]) => score > 0)
+      .sort((left, right) => right[1] - left[1]).map(([id]) => id)
+    const fused = reciprocalRankFusion([
+      { channel: 'exact', weight: this.retrieval.exactRrfWeight, ids: ranked(exact) },
+      { channel: 'bm25', weight: this.retrieval.bm25RrfWeight, ids: ranked(bm25) },
+      { channel: 'metadata', weight: this.retrieval.metadataRrfWeight, ids: ranked(metadata) },
+    ], this.retrieval.rrfK)
+    const cards = documents.flatMap(document => {
+      const signal = fused.get(document.unit.metadata.id)
+      if (signal === undefined) return []
       const lifecycleWeight = document.unit.metadata.lifecycle === 'verified' ? 1 : document.unit.metadata.lifecycle === 'stale' ? 0.55 : 0.8
-      const relevance = score * lifecycleWeight * (0.5 + document.unit.metadata.confidence / 2)
-      return cardOf(document.unit, relevance)
-    }).filter((card): card is KnowledgeCard => card !== undefined)
-
-    const max = Math.max(...cards.map(card => card.relevance), 1)
+      // 查询类型只做软提升，绝不把未命中的文档类型过滤掉，避免路由误判造成召回损失。
+      const typeWeight = typeRoutes?.[document.unit.metadata.type] ?? 1
+      const score = signal.score * typeWeight * lifecycleWeight * (0.5 + document.unit.metadata.confidence / 2)
+      return [cardOf(document.unit, score, signal.channels)]
+    })
+    const max = Math.max(...cards.map(card => card.relevance), Number.EPSILON)
     return cards
-      // 对当前结果集归一化到 0..1，便于卡片展示和 duplicateThreshold 判断。
+      // 归一化分数只用于当前结果展示；候选去重使用独立的绝对相似度，不再复用该值。
       .map(card => ({ ...card, relevance: Number((card.relevance / max).toFixed(4)) }))
       .sort((left, right) => right.relevance - left.relevance || right.confidence - left.confidence)
       .slice(0, options.limit ?? 5)
@@ -169,8 +179,10 @@ export class WikiStore {
     const tracePath = await this.writeTrace(trace)
     const distilled = distill(trace, explicit)
     // 使用标题、摘要和 triggers 搜索已有知识；取第一条超过阈值的结果作为更新目标。
-    const matches = await this.search(`${distilled.title} ${distilled.summary} ${distilled.triggers.join(' ')}`, { limit: 3 })
-    const duplicate = matches.find(card => card.relevance >= this.duplicateThreshold)
+    const duplicate = (await this.list())
+      .map(unit => ({ unit, score: duplicateScore(distilled, unit) }))
+      .filter(match => match.score >= this.duplicateThreshold)
+      .sort((left, right) => right.score - left.score)[0]?.unit
     const now = new Date().toISOString()
     const candidateId = `candidate-${slugify(distilled.title)}-${contentVersion(`${trace.sessionId}:${trace.turn}:${explicit ?? ''}`)}`
     const candidate: KnowledgeCandidate = {
@@ -181,7 +193,7 @@ export class WikiStore {
       status: 'pending-review',
     }
     const verification = verifyCandidate(candidate, trace)
-    const targetId = duplicate?.id ?? canonicalId(candidate.type, candidate.title)
+    const targetId = duplicate?.metadata.id ?? canonicalId(candidate.type, candidate.title)
     const patch: KnowledgePatch = {
       patchId: `patch-${contentVersion(candidateId)}`,
       candidateId,
@@ -297,7 +309,8 @@ async function markdownFiles(root: string): Promise<string[]> {
   async function visit(directory: string): Promise<void> {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
-      if (entry.isDirectory()) await visit(path)
+      // temp 保存合并 Wiki 与评测集，不是运行时规范知识；否则 evaluate.md 会被当作知识页解析。
+      if (entry.isDirectory() && entry.name !== 'temp') await visit(path)
       else if (entry.isFile() && entry.name.endsWith('.md')) output.push(path)
     }
   }
@@ -358,27 +371,45 @@ function boundedConfidence(value: unknown): number {
 }
 
 /**
- * 把知识页编译成搜索文档。
- * 标题、摘要和别名重复一次等价于提高字段权重；正文只出现一次，防止长正文压过精确标题。
+ * 把类型化知识页编译成 BM25F 搜索文档。
+ * 每个字段独立统计长度和词频，权重直接表达“标题/症状/规则比普通正文更重要”。
  */
 function searchDocument(unit: KnowledgeUnit): SearchDocument {
   const metadata = unit.metadata
-  const weighted = [
-    metadata.id,
-    metadata.title, metadata.title,
-    metadata.summary, metadata.summary,
-    metadata.aliases.join(' '), metadata.aliases.join(' '),
-    metadata.triggers.join(' '), metadata.scope.repos.join(' '), metadata.scope.domains.join(' '), metadata.scope.modules.join(' '),
-    unit.body,
-  ].join('\n')
-  const tokens = tokenize(weighted)
+  const scope = [metadata.scope.repos, metadata.scope.domains, metadata.scope.modules].flat().join(' ')
+  const primarySections = metadata.type === 'problem-pattern'
+    ? ['Symptoms', 'Trigger Conditions', 'Root Cause', 'Diagnosis', 'Solution Pattern']
+    : metadata.type === 'business-rule'
+      ? ['Rule', 'Exceptions', 'Reason']
+      : ['Decision', 'Context', 'Rejected Alternatives', 'Trade-offs']
+  const primary = primarySections.map(section => extractSection(unit.body, section) ?? '').join('\n')
+  const fields: Record<string, Bm25fField> = {
+    id: bm25fField(metadata.id, 5, 0),
+    title: bm25fField(metadata.title, 3, 0.2),
+    aliases: bm25fField(metadata.aliases.join(' '), 2.5, 0.3),
+    triggers: bm25fField(metadata.triggers.join(' '), 2.5, 0.5),
+    summary: bm25fField(metadata.summary, 2, 0.6),
+    scope: bm25fField(scope, 1.8, 0.2),
+    primary: bm25fField(primary, 1.7, 0.7),
+    // 全文保底保证未被结构投影覆盖的细节仍能召回，但权重低于规范字段。
+    body: bm25fField(unit.body, 0.65, 0.8),
+  }
+  const metadataTokens = new Set(tokenize([
+    metadata.id, metadata.title, metadata.summary, metadata.aliases.join(' '), metadata.triggers.join(' '),
+    metadata.scope.repos.join(' '), metadata.scope.domains.join(' '), metadata.scope.modules.join(' '),
+  ].join(' ')))
+  return { unit, fields, metadataTokens }
+}
+
+function bm25fField(value: string, weight: number, b: number): Bm25fField {
+  const tokens = tokenize(value)
   const termCounts = new Map<string, number>()
   for (const token of tokens) termCounts.set(token, (termCounts.get(token) ?? 0) + 1)
-  return { unit, tokens, termCounts }
+  return { tokens, termCounts, weight, b }
 }
 
 /** 把完整知识页投影成不含正文的低成本 L0 卡片。 */
-function cardOf(unit: KnowledgeUnit, relevance: number): KnowledgeCard {
+function cardOf(unit: KnowledgeUnit, relevance: number, retrievalChannels?: KnowledgeCard['retrievalChannels']): KnowledgeCard {
   return {
     id: unit.metadata.id,
     title: unit.metadata.title,
@@ -389,7 +420,43 @@ function cardOf(unit: KnowledgeUnit, relevance: number): KnowledgeCard {
     confidence: unit.metadata.confidence,
     relevance,
     version: unit.version,
+    ...(retrievalChannels === undefined ? {} : { retrievalChannels }),
   }
+}
+
+function exactFieldScore(unit: KnowledgeUnit, query: string): number {
+  const normalized = query.trim().toLocaleLowerCase()
+  const fields = [unit.metadata.id, unit.metadata.title, ...unit.metadata.aliases, ...unit.metadata.triggers]
+    .map(value => value.trim().toLocaleLowerCase()).filter(Boolean)
+  if (fields.includes(normalized)) return 1
+  if (normalized.length >= 6 && fields.some(value => value.includes(normalized) || normalized.includes(value))) return 0.75
+  return 0
+}
+
+function tokenCoverage(queryTokens: string[], documentTokens: ReadonlySet<string>): number {
+  const query = [...new Set(queryTokens)]
+  if (query.length === 0) return 0
+  return query.filter(token => documentTokens.has(token)).length / query.length
+}
+
+/** 去重使用跨查询稳定的字段相似度，不使用结果集内归一化的展示相关度。 */
+function duplicateScore(candidate: Pick<KnowledgeCandidate, 'type' | 'title' | 'summary' | 'aliases' | 'triggers'>, unit: KnowledgeUnit): number {
+  if (candidate.type !== unit.metadata.type) return 0
+  const title = candidate.title.trim().toLocaleLowerCase()
+  const existingNames = [unit.metadata.title, ...unit.metadata.aliases].map(value => value.trim().toLocaleLowerCase())
+  if (existingNames.includes(title)) return 1
+  const candidateNames = [title, ...candidate.aliases.map(value => value.toLocaleLowerCase())]
+  if (candidateNames.some(value => existingNames.includes(value))) return 0.95
+  const similarity = (left: string, right: string): number => {
+    const a = new Set(tokenize(left))
+    const b = new Set(tokenize(right))
+    const union = new Set([...a, ...b])
+    return union.size === 0 ? 0 : [...a].filter(token => b.has(token)).length / union.size
+  }
+  const titleScore = similarity(candidate.title, unit.metadata.title)
+  const summaryScore = similarity(candidate.summary, unit.metadata.summary)
+  const triggerScore = similarity(candidate.triggers.join(' '), unit.metadata.triggers.join(' '))
+  return 0.55 * titleScore + 0.3 * summaryScore + 0.15 * triggerScore
 }
 
 /**

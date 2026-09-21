@@ -1,4 +1,4 @@
-import type { EngineeringTrace, KnowledgeType } from './types.ts'
+import type { EngineeringTrace, KnowledgeCard, KnowledgeType } from './types.ts'
 
 /** 轻量模型对“是否检索历史知识”的结构化判断。 */
 export interface RetrievalDecision {
@@ -16,6 +16,10 @@ export interface LearningDecision {
   aliases?: string[]
   triggers?: string[]
   reason: string
+}
+
+export interface RerankDecision {
+  ranking: Array<{ id: string; score: number; reason: string }>
 }
 
 /**
@@ -61,6 +65,23 @@ export function parseLearningDecision(source: string): LearningDecision {
   }
 }
 
+/** 校验重排序结果，并拒绝未知 ID、重复 ID 和越界分数。 */
+export function parseRerankDecision(source: string, allowedIds: ReadonlySet<string>): RerankDecision {
+  const value = jsonObject(source)
+  if (!Array.isArray(value.ranking) || value.ranking.length === 0) throw new Error('rerank decision requires a non-empty ranking')
+  const seen = new Set<string>()
+  const ranking = value.ranking.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error(`ranking[${index}] must be an object`)
+    const item = entry as Record<string, unknown>
+    const id = requiredString(item.id, `ranking[${index}].id`, 240)
+    if (!allowedIds.has(id) || seen.has(id)) throw new Error(`ranking contains unknown or duplicate id "${id}"`)
+    if (typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 1) throw new Error(`ranking[${index}].score must be between 0 and 1`)
+    seen.add(id)
+    return { id, score: item.score, reason: requiredString(item.reason, `ranking[${index}].reason`, 240) }
+  })
+  return { ranking }
+}
+
 /** 把已校验的模型判断转换成 WikiStore 的确定性显式提炼格式。 */
 export function learningProposal(decision: LearningDecision): string | undefined {
   if (decision.action === 'skip') return undefined
@@ -101,6 +122,25 @@ export function learningPrompt(trace: EngineeringTrace): string {
     'learn 时选择 problem-pattern、business-rule、architecture-decision 之一，并给出可脱离本次会话阅读的标题、摘要、别名和触发症状。不要虚构输入中没有的事实。',
     '只输出单行 JSON：{"action":"learn|skip","type":"problem-pattern|business-rule|architecture-decision","title":"...","summary":"...","aliases":["..."],"triggers":["..."],"reason":"..."}',
     `轨迹事实：${JSON.stringify(facts)}`,
+  ].join('\n')
+}
+
+/** 只使用 L0 字段构造低成本重排序提示，不发送完整 Wiki 正文。 */
+export function rerankPrompt(query: string, cards: KnowledgeCard[]): string {
+  const candidates = cards.map(card => ({
+    id: card.id,
+    title: card.title,
+    type: card.type,
+    summary: card.summary,
+    lifecycle: card.lifecycle,
+    confidence: card.confidence,
+  }))
+  return [
+    '你是工程知识检索重排序器。根据查询与候选的症状、业务语义和架构含义重新排序。不要添加候选列表之外的 ID。',
+    '优先真正能指导当前任务的知识；仅共享宽泛词语但机制不同的候选应降级。',
+    '只输出单行 JSON：{"ranking":[{"id":"...","score":0.0,"reason":"..."}]}，score 必须位于 0 到 1。',
+    `查询：${query.trim().slice(0, 1000)}`,
+    `候选：${JSON.stringify(candidates)}`,
   ].join('\n')
 }
 

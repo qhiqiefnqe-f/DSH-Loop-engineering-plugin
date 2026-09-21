@@ -3,6 +3,7 @@ import {
   learningProposal,
   parseLearningDecision,
   parseRetrievalDecision,
+  parseRerankDecision,
   retrievalPrefilter,
 } from '../src/decision-gate.ts'
 
@@ -36,5 +37,11 @@ describe('lightweight knowledge decision gate', () => {
   it('keeps a skip decision free of candidate fields', () => {
     expect(parseLearningDecision('{"action":"skip","reason":"One-off formatting change"}'))
       .toEqual({ action: 'skip', reason: 'One-off formatting change' })
+  })
+
+  it('accepts only known unique ids from the reranker', () => {
+    const source = '{"ranking":[{"id":"a","score":0.9,"reason":"symptom match"}]}'
+    expect(parseRerankDecision(source, new Set(['a', 'b'])).ranking[0]?.id).toBe('a')
+    expect(() => parseRerankDecision(source, new Set(['b']))).toThrow(/unknown/)
   })
 })

@@ -1,9 +1,13 @@
 - insert:
+    # 将插件插入 Harness Web profile；id 用于 Cordis 识别和覆盖同名实例。
     - id: loop-engineering
+      # file URL 必须改成当前机器上的插件入口绝对路径。
       name: 'file:///D:/code/deepseek-harness/loop-engineering-plugin/src/index.ts'
       config:
+        # wikiDir 是可提交的规范知识；stateDir 是被 Git 忽略、可重建的运行状态。
         wikiDir: 'D:/code/deepseek-harness/loop-engineering-plugin/wiki'
         stateDir: 'D:/code/deepseek-harness/loop-engineering-plugin/.loop-engineering'
+        # 自动读取链：最多检索两次，每次只注入少量 L0 卡片，避免挤占主任务上下文。
         automaticRetrieval: true
         maxAutomaticRetrievalsPerTask: 2
         maxSearchResults: 5
@@ -16,3 +20,12 @@
         judgeModel: 'deepseek-v4-flash'
         judgeMaxTokens: 320
         judgeTimeoutMs: 12000
+        # 三路排名通过 RRF 融合；精确字段的可信度高，因此权重最大。
+        rrfK: 60
+        exactRrfWeight: 2
+        bm25RrfWeight: 1
+        metadataRrfWeight: 0.8
+        # 仅在非精确命中且前两名分差小时调用 Flash 重排，控制延迟和成本。
+        conditionalRerank: true
+        rerankCandidateLimit: 6
+        rerankMarginThreshold: 0.12

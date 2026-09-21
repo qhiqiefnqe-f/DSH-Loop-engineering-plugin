@@ -11,6 +11,7 @@ import { TraceBuilder, worthDistilling } from './trace-builder.ts'
 import { WikiStore } from './wiki-store.ts'
 import { learningProposal, retrievalPrefilter } from './decision-gate.ts'
 import { FlashKnowledgeJudge } from './flash-judge.ts'
+import { applyRerank, shouldConditionallyRerank } from './retrieval.ts'
 
 /**
  * Loop Engineering 的 Cordis 插件入口。
@@ -52,6 +53,13 @@ export interface Config {
   /** 单次判断的输出与等待上限。 */
   judgeMaxTokens: number
   judgeTimeoutMs: number
+  rrfK: number
+  exactRrfWeight: number
+  bm25RrfWeight: number
+  metadataRrfWeight: number
+  conditionalRerank: boolean
+  rerankCandidateLimit: number
+  rerankMarginThreshold: number
 }
 
 // Schemastery 同时提供默认值和 Cordis 可理解的运行时配置 schema。
@@ -70,6 +78,13 @@ export const Config: Schema<Config> = Schema.object({
   judgeModel: Schema.string().default('deepseek-v4-flash'),
   judgeMaxTokens: Schema.number().default(320),
   judgeTimeoutMs: Schema.number().default(12000),
+  rrfK: Schema.number().default(60),
+  exactRrfWeight: Schema.number().default(2),
+  bm25RrfWeight: Schema.number().default(1),
+  metadataRrfWeight: Schema.number().default(0.8),
+  conditionalRerank: Schema.boolean().default(true),
+  rerankCandidateLimit: Schema.number().default(6),
+  rerankMarginThreshold: Schema.number().default(0.12),
 })
 
 /** 安装本地 Wiki、4 个模型工具、审查命令和自动循环钩子。 */
@@ -80,6 +95,10 @@ export function apply(ctx: Context, config: Config): void {
     wikiDir: resolved.wikiDir,
     stateDir: resolved.stateDir,
     duplicateThreshold: resolved.duplicateThreshold,
+    rrfK: resolved.rrfK,
+    exactRrfWeight: resolved.exactRrfWeight,
+    bm25RrfWeight: resolved.bm25RrfWeight,
+    metadataRrfWeight: resolved.metadataRrfWeight,
   })
   const traces = new TraceBuilder()
   const judge = new FlashKnowledgeJudge(ctx, {
@@ -107,7 +126,7 @@ export function apply(ctx: Context, config: Config): void {
     text: 'You have access to compiled team engineering knowledge. Search it when historical business rules, recurring problem patterns, or architecture decisions may affect the task. Search returns compact cards; read only the relevant page or section, and request evidence only when verification is needed. Treat stale knowledge as a lead, not a fact.',
   })
 
-  registerTools(ctx, store, workingSets, resolved)
+  registerTools(ctx, store, judge, workingSets, resolved)
   registerCommands(ctx, store, traces)
 
   /**
@@ -187,7 +206,7 @@ export function apply(ctx: Context, config: Config): void {
     if (workingSet.searches.includes(queryKey)) return decision
     workingSet.searches.push(queryKey)
 
-    const cards = (await store.search(query, { limit: resolved.maxSearchResults }))
+    const cards = (await searchWithOptionalRerank(ctx, store, judge, query, sessionId, resolved.maxSearchResults, resolved))
       // 已展开或被负面反馈否定的知识不再自动占用上下文；显式工具搜索仍然不受限制。
       .filter(card => !workingSet.loaded.has(card.id) && !workingSet.dismissed.has(card.id))
     if (cards.length === 0) return decision
@@ -209,6 +228,7 @@ export function apply(ctx: Context, config: Config): void {
 function registerTools(
   ctx: Context,
   store: WikiStore,
+  judge: FlashKnowledgeJudge,
   workingSets: Map<string, KnowledgeWorkingSet>,
   config: Config,
 ): void {
@@ -226,7 +246,8 @@ function registerTools(
       // 工具 schema 只能表达基础类型，枚举值和上限在执行时再做严格校验。
       const type = optionalKnowledgeType(args.type)
       const limit = integerLimit(args.limit, config.maxSearchResults)
-      const cards = await store.search(args.query, { ...(type === undefined ? {} : { type }), limit })
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const cards = await searchWithOptionalRerank(ctx, store, judge, args.query, sessionId, limit, config, type)
       const workingSet = exec.agent === undefined ? undefined : workingSetFor(workingSets, String(exec.agent.session.id))
       for (const card of cards) {
         workingSet?.candidates.add(card.id)
@@ -354,6 +375,30 @@ function registerCommands(ctx: Context, store: WikiStore, traces: TraceBuilder):
   })
 }
 
+/** 多路融合先取较大候选集，只有分差较小时才调用 Flash 重排；失败保持融合顺序。 */
+async function searchWithOptionalRerank(
+  ctx: Context,
+  store: WikiStore,
+  judge: FlashKnowledgeJudge,
+  query: string,
+  sessionId: string | undefined,
+  limit: number,
+  config: Config,
+  type?: KnowledgeType,
+): Promise<KnowledgeCard[]> {
+  const candidateLimit = Math.max(limit, config.rerankCandidateLimit)
+  let cards = await store.search(query, { ...(type === undefined ? {} : { type }), limit: candidateLimit })
+  if (!config.conditionalRerank || !config.lightweightJudge || sessionId === undefined
+    || !shouldConditionallyRerank(cards, config.rerankMarginThreshold)) return cards.slice(0, limit)
+  try {
+    const decision = await judge.rerank(query, cards, sessionId)
+    cards = applyRerank(cards, decision.ranking)
+  } catch (error) {
+    ctx.logger.warn(`loop-engineering reranker failed; using RRF order: ${String(error)}`)
+  }
+  return cards.slice(0, limit)
+}
+
 /** 把相对路径转成绝对路径，并拒绝无效的整数、比例或字符预算。 */
 function resolveConfig(config: Config): Config {
   const positiveInteger = (name: string, value: number): number => {
@@ -362,6 +407,10 @@ function resolveConfig(config: Config): Config {
   }
   const ratio = (name: string, value: number): number => {
     if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${name} must be between 0 and 1`)
+    return value
+  }
+  const positiveNumber = (name: string, value: number): number => {
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite number`)
     return value
   }
   const nonEmpty = (name: string, value: string): string => {
@@ -383,6 +432,12 @@ function resolveConfig(config: Config): Config {
     judgeModel: nonEmpty('judgeModel', config.judgeModel),
     judgeMaxTokens: positiveInteger('judgeMaxTokens', config.judgeMaxTokens),
     judgeTimeoutMs: positiveInteger('judgeTimeoutMs', config.judgeTimeoutMs),
+    rrfK: positiveInteger('rrfK', config.rrfK),
+    exactRrfWeight: positiveNumber('exactRrfWeight', config.exactRrfWeight),
+    bm25RrfWeight: positiveNumber('bm25RrfWeight', config.bm25RrfWeight),
+    metadataRrfWeight: positiveNumber('metadataRrfWeight', config.metadataRrfWeight),
+    rerankCandidateLimit: positiveInteger('rerankCandidateLimit', config.rerankCandidateLimit),
+    rerankMarginThreshold: ratio('rerankMarginThreshold', config.rerankMarginThreshold),
   }
 }
 
