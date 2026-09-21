@@ -3,3 +3,7 @@ node_modules/
 *.tsbuildinfo
 *.stdout.log
 *.stderr.log
+
+# 根目录说明文档只发布 README；PRD、架构分析和简历材料保留在本地。
+/*.md
+!/README.md

@@ -14,7 +14,10 @@ afterEach(async () => {
 async function store(): Promise<WikiStore> {
   const root = await mkdtemp(join(tmpdir(), 'loop-engineering-'))
   roots.push(root)
-  const value = new WikiStore({ wikiDir: join(root, 'wiki'), stateDir: join(root, 'state'), duplicateThreshold: 0.5 })
+  const value = new WikiStore({
+    wikiDir: join(root, 'wiki'), stateDir: join(root, 'state'), duplicateThreshold: 0.5,
+    rrfK: 60, exactRrfWeight: 2, bm25RrfWeight: 1, metadataRrfWeight: 0.8,
+  })
   await value.initialize()
   return value
 }
@@ -71,6 +74,20 @@ describe('WikiStore MVP loop', () => {
     expect(units[0]?.metadata.sources).toEqual(expect.arrayContaining(['session:bug-a', 'session:bug-b']))
   })
 
+  it('does not treat a weak lexical overlap as the same knowledge after score normalization', async () => {
+    const wiki = await store()
+    const first = await wiki.propose(trace('bug-a', 1), 'problem-pattern | Persisted State Hydration Race | Cold reload can read state before hydration completes. | hydration race | cold reload,state missing')
+    await wiki.publish(first.candidate.candidateId)
+
+    const different = await wiki.propose(
+      trace('bug-c', 3, 'Refresh token rotation fails when concurrent requests renew authentication'),
+      'problem-pattern | Concurrent Refresh Token Rotation Failure | Parallel authentication requests can rotate the same refresh token twice. | token rotation | concurrent refresh,authentication',
+    )
+
+    expect(different.patch.operation).toBe('create')
+    expect(different.patch.targets).not.toEqual([first.patch.targets[0]])
+  })
+
   it('keeps business rules reviewed and rejects unsupported publication', async () => {
     const wiki = await store()
     const ruleTrace = { ...trace('rule-a', 1, 'Cancellation must preserve current-period entitlement'), tests: [], resolutionConfidence: 0.72 }
@@ -80,5 +97,17 @@ describe('WikiStore MVP loop', () => {
 
     const candidateSource = await readFile(join(wiki.stateDir, 'candidates', `${proposal.candidate.candidateId}.json`), 'utf8')
     expect(candidateSource).toContain('"status": "published"')
+  })
+
+  it('dismisses a candidate without changing the canonical wiki', async () => {
+    const wiki = await store()
+    const proposal = await wiki.propose(trace('dismiss-a', 1), 'problem-pattern | Rejected Example Pattern | This candidate must remain outside the canonical wiki.')
+
+    await wiki.dismiss(proposal.candidate.candidateId)
+
+    expect(await wiki.list()).toHaveLength(0)
+    const candidateSource = await readFile(join(wiki.stateDir, 'candidates', `${proposal.candidate.candidateId}.json`), 'utf8')
+    expect(candidateSource).toContain('"status": "dismissed"')
+    await expect(wiki.publish(proposal.candidate.candidateId)).rejects.toThrow(/dismissed/)
   })
 })

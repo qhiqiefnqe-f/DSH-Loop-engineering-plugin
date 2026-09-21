@@ -9,6 +9,9 @@ import type { EngineeringTrace, KnowledgeCard, KnowledgeType, KnowledgeWorkingSe
 import { boundText, contentText, contentVersion } from './text.ts'
 import { TraceBuilder, worthDistilling } from './trace-builder.ts'
 import { WikiStore } from './wiki-store.ts'
+import { learningProposal, retrievalPrefilter } from './decision-gate.ts'
+import { FlashKnowledgeJudge } from './flash-judge.ts'
+import { applyRerank, shouldConditionallyRerank } from './retrieval.ts'
 
 /**
  * Loop Engineering 的 Cordis 插件入口。
@@ -21,7 +24,7 @@ import { WikiStore } from './wiki-store.ts'
 // Cordis 用稳定名字识别插件实例，日志和插件来源消息也使用这个名字。
 export const name = 'loop-engineering'
 // 声明 apply() 启动前必须已经存在的 Cordis 服务；缺失时让加载器尽早报错。
-export const inject = ['tools', 'commands', 'systemPrompt']
+export const inject = ['tools', 'commands', 'systemPrompt', 'llm']
 
 /** 用户可通过 Cordis 配置调整的 MVP 部署选项。 */
 export interface Config {
@@ -42,6 +45,21 @@ export interface Config {
   /** 单张卡片和整次自动上下文的字符预算。 */
   maxCardChars: number
   maxContextChars: number
+  /** 是否用轻量模型判断语义模糊的学习和检索触发。 */
+  lightweightJudge: boolean
+  /** 轻量判断模型的 Harness provider 和 model。 */
+  judgeProvider: string
+  judgeModel: string
+  /** 单次判断的输出与等待上限。 */
+  judgeMaxTokens: number
+  judgeTimeoutMs: number
+  rrfK: number
+  exactRrfWeight: number
+  bm25RrfWeight: number
+  metadataRrfWeight: number
+  conditionalRerank: boolean
+  rerankCandidateLimit: number
+  rerankMarginThreshold: number
 }
 
 // Schemastery 同时提供默认值和 Cordis 可理解的运行时配置 schema。
@@ -55,6 +73,18 @@ export const Config: Schema<Config> = Schema.object({
   autoCandidateThreshold: Schema.number().default(0.65),
   maxCardChars: Schema.number().default(520),
   maxContextChars: Schema.number().default(2400),
+  lightweightJudge: Schema.boolean().default(true),
+  judgeProvider: Schema.string().default('deepseek-official'),
+  judgeModel: Schema.string().default('deepseek-v4-flash'),
+  judgeMaxTokens: Schema.number().default(320),
+  judgeTimeoutMs: Schema.number().default(12000),
+  rrfK: Schema.number().default(60),
+  exactRrfWeight: Schema.number().default(2),
+  bm25RrfWeight: Schema.number().default(1),
+  metadataRrfWeight: Schema.number().default(0.8),
+  conditionalRerank: Schema.boolean().default(true),
+  rerankCandidateLimit: Schema.number().default(6),
+  rerankMarginThreshold: Schema.number().default(0.12),
 })
 
 /** 安装本地 Wiki、4 个模型工具、审查命令和自动循环钩子。 */
@@ -65,8 +95,19 @@ export function apply(ctx: Context, config: Config): void {
     wikiDir: resolved.wikiDir,
     stateDir: resolved.stateDir,
     duplicateThreshold: resolved.duplicateThreshold,
+    rrfK: resolved.rrfK,
+    exactRrfWeight: resolved.exactRrfWeight,
+    bm25RrfWeight: resolved.bm25RrfWeight,
+    metadataRrfWeight: resolved.metadataRrfWeight,
   })
   const traces = new TraceBuilder()
+  const judge = new FlashKnowledgeJudge(ctx, {
+    provider: resolved.judgeProvider,
+    model: resolved.judgeModel,
+    maxTokens: resolved.judgeMaxTokens,
+    timeoutMs: resolved.judgeTimeoutMs,
+    stateDir: resolved.stateDir,
+  })
   // 工作集只活在当前 Web 进程内，按 session 隔离，负责自动检索去重。
   const workingSets = new Map<string, KnowledgeWorkingSet>()
   // 工具结果里的强错误片段会触发下一 step 的第二次检索。
@@ -85,7 +126,7 @@ export function apply(ctx: Context, config: Config): void {
     text: 'You have access to compiled team engineering knowledge. Search it when historical business rules, recurring problem patterns, or architecture decisions may affect the task. Search returns compact cards; read only the relevant page or section, and request evidence only when verification is needed. Treat stale knowledge as a lead, not a fact.',
   })
 
-  registerTools(ctx, store, workingSets, resolved)
+  registerTools(ctx, store, judge, workingSets, resolved)
   registerCommands(ctx, store, traces)
 
   /**
@@ -106,8 +147,22 @@ export function apply(ctx: Context, config: Config): void {
     writeQueue = writeQueue.then(async () => {
       await store.writeTrace(trace)
       if (!worthDistilling(trace, resolved.autoCandidateThreshold)) return
+      let explicit: string | undefined
+      if (resolved.lightweightJudge) {
+        try {
+          const decision = await judge.learning(trace)
+          if (decision.action === 'skip') {
+            ctx.logger.info(`loop-engineering skipped learning for ${sessionId}:${trace.turn}: ${decision.reason}`)
+            return
+          }
+          explicit = learningProposal(decision)
+        } catch (error) {
+          // 判断模型不可用时保留原有确定性行为，避免一次网络故障丢失高证据轨迹。
+          ctx.logger.warn(`loop-engineering learning judge failed; using deterministic fallback: ${String(error)}`)
+        }
+      }
       // propose 内部会先搜索 Wiki，决定 CREATE 还是 UPDATE，并只写待审 JSON。
-      const { candidate, patch } = await store.propose(trace)
+      const { candidate, patch } = await store.propose(trace, explicit)
       ctx.logger.info(`loop-engineering candidate ${candidate.candidateId}: ${patch.operation} ${patch.targets.join(', ')} (${patch.verification})`)
     }).catch((error: unknown) => {
       ctx.logger.warn(`loop-engineering write path failed: ${String(error)}`)
@@ -133,14 +188,25 @@ export function apply(ctx: Context, config: Config): void {
       .filter(Boolean)
       .join('\n')
     // 第一步用用户任务；后续步骤只有出现强错误证据才触发，普通对话不额外检索。
-    const query = payload.step === 1 ? directText : strongEvidence.get(sessionId)
-    if (query === undefined || !retrievalWorthwhile(query)) return decision
+    let query = payload.step === 1 ? directText : strongEvidence.get(sessionId)
+    if (query === undefined || !retrievalPrefilter(query)) return decision
+    // 第二步的强错误片段本身就是高精度检索词；只有任务开始时的模糊意图才值得调用轻量模型。
+    if (payload.step === 1 && resolved.lightweightJudge) {
+      try {
+        const judged = await judge.retrieval(query, sessionId)
+        if (judged.action === 'skip') return decision
+        query = judged.query
+      } catch (error) {
+        // 回退为预过滤后的原始任务，让模型故障只影响精度、不影响可用性。
+        ctx.logger.warn(`loop-engineering retrieval judge failed; using deterministic fallback: ${String(error)}`)
+      }
+    }
     const queryKey = contentVersion(query.toLocaleLowerCase())
     // 同样的 query 在同一 session 只自动执行一次。
     if (workingSet.searches.includes(queryKey)) return decision
     workingSet.searches.push(queryKey)
 
-    const cards = (await store.search(query, { limit: resolved.maxSearchResults }))
+    const cards = (await searchWithOptionalRerank(ctx, store, judge, query, sessionId, resolved.maxSearchResults, resolved))
       // 已展开或被负面反馈否定的知识不再自动占用上下文；显式工具搜索仍然不受限制。
       .filter(card => !workingSet.loaded.has(card.id) && !workingSet.dismissed.has(card.id))
     if (cards.length === 0) return decision
@@ -162,6 +228,7 @@ export function apply(ctx: Context, config: Config): void {
 function registerTools(
   ctx: Context,
   store: WikiStore,
+  judge: FlashKnowledgeJudge,
   workingSets: Map<string, KnowledgeWorkingSet>,
   config: Config,
 ): void {
@@ -179,7 +246,8 @@ function registerTools(
       // 工具 schema 只能表达基础类型，枚举值和上限在执行时再做严格校验。
       const type = optionalKnowledgeType(args.type)
       const limit = integerLimit(args.limit, config.maxSearchResults)
-      const cards = await store.search(args.query, { ...(type === undefined ? {} : { type }), limit })
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const cards = await searchWithOptionalRerank(ctx, store, judge, args.query, sessionId, limit, config, type)
       const workingSet = exec.agent === undefined ? undefined : workingSetFor(workingSets, String(exec.agent.session.id))
       for (const card of cards) {
         workingSet?.candidates.add(card.id)
@@ -288,14 +356,14 @@ function registerCommands(ctx: Context, store: WikiStore, traces: TraceBuilder):
   ctx.commands.register({
     name: 'knowledge-review',
     description: 'Publish or dismiss one reviewed knowledge patch.',
-    input: { hint: '<publish|dismiss> <candidate-id>' },
+    input: { hint: '<publish|dismiss|发布|驳回> <candidate-id>' },
     async handler(invocation: CommandInvocation) {
-      const match = /^\s*(publish|dismiss)\s+(\S+)\s*$/iu.exec(invocation.rawInput)
-      if (match === null) return { kind: 'error', text: 'Usage: /knowledge-review <publish|dismiss> <candidate-id>' }
+      const match = /^\s*(publish|dismiss|发布|驳回)\s+(\S+)\s*$/iu.exec(invocation.rawInput)
+      if (match === null) return { kind: 'error', text: 'Usage: /knowledge-review <publish|dismiss|发布|驳回> <candidate-id>' }
       const action = match[1]?.toLocaleLowerCase()
       const candidateId = match[2]
       if (candidateId === undefined) return { kind: 'error', text: 'Candidate id is required.' }
-      if (action === 'dismiss') {
+      if (action === 'dismiss' || action === '驳回') {
         // dismiss 只更新候选状态，绝不触碰 wiki 目录。
         await store.dismiss(candidateId)
         return { kind: 'success', text: `Dismissed ${candidateId}; canonical wiki was not changed.` }
@@ -305,6 +373,30 @@ function registerCommands(ctx: Context, store: WikiStore, traces: TraceBuilder):
       return { kind: 'success', text: `Published ${unit.metadata.id} (${unit.metadata.lifecycle}) to the Engineering Wiki.` }
     },
   })
+}
+
+/** 多路融合先取较大候选集，只有分差较小时才调用 Flash 重排；失败保持融合顺序。 */
+async function searchWithOptionalRerank(
+  ctx: Context,
+  store: WikiStore,
+  judge: FlashKnowledgeJudge,
+  query: string,
+  sessionId: string | undefined,
+  limit: number,
+  config: Config,
+  type?: KnowledgeType,
+): Promise<KnowledgeCard[]> {
+  const candidateLimit = Math.max(limit, config.rerankCandidateLimit)
+  let cards = await store.search(query, { ...(type === undefined ? {} : { type }), limit: candidateLimit })
+  if (!config.conditionalRerank || !config.lightweightJudge || sessionId === undefined
+    || !shouldConditionallyRerank(cards, config.rerankMarginThreshold)) return cards.slice(0, limit)
+  try {
+    const decision = await judge.rerank(query, cards, sessionId)
+    cards = applyRerank(cards, decision.ranking)
+  } catch (error) {
+    ctx.logger.warn(`loop-engineering reranker failed; using RRF order: ${String(error)}`)
+  }
+  return cards.slice(0, limit)
 }
 
 /** 把相对路径转成绝对路径，并拒绝无效的整数、比例或字符预算。 */
@@ -317,6 +409,15 @@ function resolveConfig(config: Config): Config {
     if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${name} must be between 0 and 1`)
     return value
   }
+  const positiveNumber = (name: string, value: number): number => {
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite number`)
+    return value
+  }
+  const nonEmpty = (name: string, value: string): string => {
+    const trimmed = value.trim()
+    if (trimmed.length === 0) throw new Error(`${name} must be a non-empty string`)
+    return trimmed
+  }
   return {
     ...config,
     wikiDir: resolve(config.wikiDir),
@@ -327,6 +428,16 @@ function resolveConfig(config: Config): Config {
     autoCandidateThreshold: ratio('autoCandidateThreshold', config.autoCandidateThreshold),
     maxCardChars: positiveInteger('maxCardChars', config.maxCardChars),
     maxContextChars: positiveInteger('maxContextChars', config.maxContextChars),
+    judgeProvider: nonEmpty('judgeProvider', config.judgeProvider),
+    judgeModel: nonEmpty('judgeModel', config.judgeModel),
+    judgeMaxTokens: positiveInteger('judgeMaxTokens', config.judgeMaxTokens),
+    judgeTimeoutMs: positiveInteger('judgeTimeoutMs', config.judgeTimeoutMs),
+    rrfK: positiveInteger('rrfK', config.rrfK),
+    exactRrfWeight: positiveNumber('exactRrfWeight', config.exactRrfWeight),
+    bm25RrfWeight: positiveNumber('bm25RrfWeight', config.bm25RrfWeight),
+    metadataRrfWeight: positiveNumber('metadataRrfWeight', config.metadataRrfWeight),
+    rerankCandidateLimit: positiveInteger('rerankCandidateLimit', config.rerankCandidateLimit),
+    rerankMarginThreshold: ratio('rerankMarginThreshold', config.rerankMarginThreshold),
   }
 }
 
@@ -390,17 +501,6 @@ function renderAutomaticContext(cards: KnowledgeCard[], trigger: 'task-start' | 
     'These are prior team claims, not current-runtime proof. Read a relevant id/section before relying on it.',
     ...cards.map(card => renderCard(card, 520)),
   ].join('\n\n')
-}
-
-/**
- * 自动检索的极低成本前置门。
- * 太短、纯格式化/翻译/简单解释任务直接跳过；只有包含工程问题、规则或架构信号时才访问 Wiki。
- */
-function retrievalWorthwhile(query: string): boolean {
-  const trimmed = query.trim()
-  if (trimmed.length < 12) return false
-  if (/^(?:format|格式化|翻译|translate|改(?:一下)?(?:颜色|文案)|解释\s+(?:api|语法))/iu.test(trimmed)) return false
-  return /error|exception|failed|bug|fix|debug|架构|业务|规则|状态|刷新|崩溃|失败|错误|异常|模块|依赖|修改|实现/iu.test(trimmed)
 }
 
 /**

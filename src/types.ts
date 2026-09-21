@@ -82,6 +82,8 @@ export interface KnowledgeCard {
   confidence: number
   relevance: number
   version: string
+  /** 多路召回融合时实际命中的通道；关系图导航等非搜索卡片可以没有该字段。 */
+  retrievalChannels?: Array<'exact' | 'bm25' | 'metadata'>
 }
 
 /**

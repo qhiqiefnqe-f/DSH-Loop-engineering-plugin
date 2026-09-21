@@ -19,6 +19,9 @@
     "vitest": "^4.1.8"
   },
   "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json",
+    "demo:retrieval": "node --import tsx/esm scripts/demo-retrieval.ts",
+    "evaluate:retrieval": "node --import tsx/esm scripts/evaluate-retrieval.ts",
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   }
